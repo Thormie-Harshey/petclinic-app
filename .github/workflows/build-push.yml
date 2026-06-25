@@ -64,6 +64,9 @@ jobs:
     name: Validate ECR credentials
     needs: detect-changes
     if: needs.detect-changes.outputs.changes != '[]'
+    permissions:
+      id-token: write
+      contents: read
     uses: ./.github/workflows/ecr-login.yml
     with:
       aws_region: ${{ vars.AWS_REGION }}
