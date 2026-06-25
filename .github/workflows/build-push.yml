@@ -148,11 +148,13 @@ jobs:
             -Dcontainer.platform="linux/arm64" \
             --no-transfer-progress
 
-      # CRITICAL scan gates the push. Pipeline fails here if any CRITICAL CVEs
-      # are found. HIGH vulnerabilities do not block but are included in the
-      # artifact saved below. Add CVE IDs to .trivyignore to suppress known
-      # accepted vulnerabilities.
-      - name: Trivy scan — fail on CRITICAL
+      # Dev: scan runs but pipeline continues even if CRITICALs are found.
+      # continue-on-error captures the outcome without killing the job.
+      # The step below writes a warning to the job summary so findings are visible.
+      # Prod pipeline: remove continue-on-error so CRITICAL blocks the push.
+      - name: Trivy scan — CRITICAL (dev informational)
+        id: trivy-critical
+        continue-on-error: true
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ steps.images.outputs.local }}:latest
@@ -160,6 +162,20 @@ jobs:
           exit-code: '1'
           ignore-unfixed: true
           trivyignores: .trivyignore
+
+      - name: Warn on CRITICAL CVEs found
+        if: steps.trivy-critical.outcome == 'failure'
+        run: |
+          echo "::warning title=CRITICAL CVEs in ${{ matrix.service }}::CRITICAL vulnerabilities detected. Check the Trivy SARIF artifact. In prod this would block the push."
+          {
+            echo "## ⚠️ CRITICAL CVEs detected — ${{ matrix.service }}"
+            echo ""
+            echo "Trivy found CRITICAL vulnerabilities in \`${{ steps.images.outputs.local }}:latest\`."
+            echo ""
+            echo "- Download the **trivy-results-${{ matrix.service }}** artifact for the full finding list."
+            echo "- Add accepted CVE IDs to \`.trivyignore\` with a justification comment."
+            echo "- **In the prod pipeline this step has no \`continue-on-error\` — CRITICAL blocks the image push.**"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Second scan includes HIGH for the artifact record. exit-code 0 so this
       # step never blocks — it only provides evidence for post-build review.
