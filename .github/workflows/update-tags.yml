@@ -1,0 +1,42 @@
+name: Reusable — Dispatch Tag Update
+
+# Reusable workflow: fires a repository_dispatch event to the platform repo
+# after images have been built and pushed to ECR. The platform repo's
+# update-image-tags.yml workflow receives this event and commits the new
+# image tags to helm-values/ so ArgoCD can detect and deploy them.
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: "7-character commit SHA that was built and pushed"
+        type: string
+        required: true
+      services:
+        description: "Space-separated list of services that were built (e.g. 'customers-service vets-service')"
+        type: string
+        required: true
+      platform_repo:
+        description: "Platform repo in org/name format (e.g. Thormie-Harshey/petclinic-platform)"
+        type: string
+        required: true
+    secrets:
+      PLATFORM_REPO_TOKEN:
+        required: true
+
+jobs:
+  dispatch:
+    name: Notify platform repo
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Fire repository_dispatch to platform repo
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.PLATFORM_REPO_TOKEN }}
+          repository: ${{ inputs.platform_repo }}
+          event-type: app-image-built
+          client-payload: |
+            {
+              "sha": "${{ inputs.sha }}",
+              "services": "${{ inputs.services }}"
+            }

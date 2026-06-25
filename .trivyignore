@@ -1,0 +1,12 @@
+# Trivy CVE allowlist
+# Add CVE IDs here (one per line) to suppress known/accepted vulnerabilities.
+# Document WHY each entry is accepted before adding it.
+#
+# Format:
+#   CVE-YYYY-NNNNN   # reason: <justification> | accepted by: <name> | review date: YYYY-MM-DD
+#
+# Example:
+#   CVE-2023-12345   # reason: only exploitable with physical access, not applicable | accepted by: team-lead | review date: 2026-01-15
+#
+# To review current scan results: download the trivy-results-{service} artifact
+# from the failed GitHub Actions run and open the .sarif file.

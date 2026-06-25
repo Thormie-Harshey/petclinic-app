@@ -1,0 +1,43 @@
+name: Reusable — ECR Login
+
+# Reusable workflow: OIDC authentication to AWS + ECR login.
+# Called by build-push.yml as a pre-validation job (fails fast if credentials are
+# misconfigured before the matrix spins up all service builds).
+#
+# Note: The matrix build job (build-and-push) re-runs these steps inline — Docker
+# credentials are runner-local, so they cannot be shared across jobs.
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        description: "AWS region (e.g. eu-central-1) — stored in Variables tab, not Secrets"
+        type: string
+        required: true
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+    outputs:
+      registry:
+        description: "ECR registry base URL (account.dkr.ecr.region.amazonaws.com)"
+        value: ${{ jobs.ecr-login.outputs.registry }}
+
+jobs:
+  ecr-login:
+    name: Validate ECR credentials
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      registry: ${{ steps.ecr.outputs.registry }}
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2

@@ -1,0 +1,206 @@
+name: Build and Push to ECR
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1: Detect which service directories changed.
+  # Outputs a JSON array for the matrix and a space-separated string for the
+  # dispatch payload. Only changed services are built — not all 8 on every push.
+  # ─────────────────────────────────────────────────────────────────────────────
+  detect-changes:
+    name: Detect changed services
+    runs-on: ubuntu-latest
+    outputs:
+      changes: ${{ steps.filter.outputs.changes }}
+      changed_services: ${{ steps.format.outputs.changed_services }}
+      sha: ${{ steps.sha.outputs.short }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect changed service directories
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            config-server:
+              - 'spring-petclinic-config-server/**'
+            discovery-server:
+              - 'spring-petclinic-discovery-server/**'
+            api-gateway:
+              - 'spring-petclinic-api-gateway/**'
+            customers-service:
+              - 'spring-petclinic-customers-service/**'
+            visits-service:
+              - 'spring-petclinic-visits-service/**'
+            vets-service:
+              - 'spring-petclinic-vets-service/**'
+            genai-service:
+              - 'spring-petclinic-genai-service/**'
+            admin-server:
+              - 'spring-petclinic-admin-server/**'
+
+      # Convert JSON array ["customers-service","vets-service"] to
+      # space-separated string "customers-service vets-service" for the payload.
+      - name: Format service list for dispatch payload
+        id: format
+        run: |
+          SPACE_SEP=$(echo '${{ steps.filter.outputs.changes }}' | jq -r 'join(" ")')
+          echo "changed_services=${SPACE_SEP}" >> $GITHUB_OUTPUT
+
+      - name: Set 7-character commit SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 2: Pre-validate ECR credentials via reusable workflow.
+  # Fails fast if OIDC is misconfigured — before the matrix spins up parallel jobs.
+  # ─────────────────────────────────────────────────────────────────────────────
+  validate-ecr-auth:
+    name: Validate ECR credentials
+    needs: detect-changes
+    if: needs.detect-changes.outputs.changes != '[]'
+    uses: ./.github/workflows/ecr-login.yml
+    with:
+      aws_region: ${{ vars.AWS_REGION }}
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 3: Build, scan, and push — one parallel job per changed service.
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-and-push:
+    name: Build ${{ matrix.service }}
+    needs: [detect-changes, validate-ecr-auth]
+    if: needs.detect-changes.outputs.changes != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.detect-changes.outputs.changes) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # QEMU registers ARM64 emulation on the x86 GitHub Actions runner.
+      # Required so that Docker Buildx can build linux/arm64 images.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      # OIDC auth must run on this runner — Docker credentials are runner-local
+      # and cannot be shared from the validate-ecr-auth job above.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image names
+        id: images
+        env:
+          SERVICE: ${{ matrix.service }}
+          ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          REGION: ${{ vars.AWS_REGION }}
+          SHA: ${{ needs.detect-changes.outputs.sha }}
+        run: |
+          LOCAL="springcommunity/spring-petclinic-${SERVICE}"
+          ECR="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/petclinic-dev/${SERVICE}:${SHA}"
+          echo "local=${LOCAL}" >> $GITHUB_OUTPUT
+          echo "ecr=${ECR}"     >> $GITHUB_OUTPUT
+
+      # Build only the changed service module.
+      # -pl selects the module; -am also builds its parent/dependencies.
+      # -Dcontainer.platform passes the target platform to the Maven Docker plugin.
+      - name: Maven build — ${{ matrix.service }}
+        run: |
+          ./mvnw clean install \
+            -pl spring-petclinic-${{ matrix.service }} \
+            -am \
+            -P buildDocker \
+            -Dcontainer.platform="linux/arm64" \
+            --no-transfer-progress
+
+      # CRITICAL scan gates the push. Pipeline fails here if any CRITICAL CVEs
+      # are found. HIGH vulnerabilities do not block but are included in the
+      # artifact saved below. Add CVE IDs to .trivyignore to suppress known
+      # accepted vulnerabilities.
+      - name: Trivy scan — fail on CRITICAL
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.images.outputs.local }}:latest
+          severity: CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+
+      # Second scan includes HIGH for the artifact record. exit-code 0 so this
+      # step never blocks — it only provides evidence for post-build review.
+      - name: Trivy scan — save CRITICAL+HIGH results
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.images.outputs.local }}:latest
+          format: sarif
+          output: trivy-${{ matrix.service }}.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
+          trivyignores: .trivyignore
+
+      - name: Upload Trivy results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results-${{ matrix.service }}
+          path: trivy-${{ matrix.service }}.sarif
+
+      - name: Tag image for ECR
+        run: |
+          docker tag "${{ steps.images.outputs.local }}:latest" \
+                     "${{ steps.images.outputs.ecr }}"
+
+      - name: Push to ECR
+        run: docker push "${{ steps.images.outputs.ecr }}"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 4: Notify the platform repo via repository_dispatch.
+  # Fires only after ALL matrix build jobs succeed.
+  # The platform repo's update-image-tags.yml receives the event, updates
+  # helm-values/{service}.yaml with the new tag, and commits so ArgoCD deploys.
+  # ─────────────────────────────────────────────────────────────────────────────
+  notify:
+    name: Notify platform repo
+    needs: [detect-changes, build-and-push]
+    if: needs.build-and-push.result == 'success'
+    uses: ./.github/workflows/update-tags.yml
+    with:
+      sha: ${{ needs.detect-changes.outputs.sha }}
+      services: ${{ needs.detect-changes.outputs.changed_services }}
+      platform_repo: ${{ vars.PLATFORM_REPO }}
+    secrets:
+      PLATFORM_REPO_TOKEN: ${{ secrets.PLATFORM_REPO_TOKEN }}
